@@ -23,6 +23,8 @@ import asyncio
 import json
 import os
 import re
+import shlex
+import time
 
 import openai
 import taskbridge
@@ -62,6 +64,177 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "32000"))
 # providers cache automatically without markers.
 CACHE_MARK = "claude" in MODEL.lower()
 
+# The grader reads only the files the task names; a final message alone scores
+# 0 for most tasks. When the model tries to finish without having written any
+# deliverable, the loop asks it to write one first (at most this many times).
+MAX_DELIVERABLE_NUDGES = 2
+DELIVERABLE_NUDGE = (
+    "You have not written any deliverable file yet. The grader reads only the "
+    "files this task names — for most tasks it does not read your final message, "
+    "so a run that ends with no files scores 0. Write the deliverable now, at "
+    "the exact path the task names, in a first complete version (it does not "
+    "have to be perfect), then reply with your summary."
+)
+# Extensions a task instruction names for its deliverables.
+DELIVERABLE_EXTS = (
+    "zip",
+    "xlsx",
+    "docx",
+    "pdf",
+    "md",
+    "dxf",
+    "ifc",
+    "json",
+    "py",
+    "csv",
+    "txt",
+    "html",
+    "xml",
+)
+_PATH_RE = re.compile(
+    r"[A-Za-z0-9_.\-/]*[A-Za-z0-9_\-]/[A-Za-z0-9_.\-/]*\."
+    r"(?:" + "|".join(DELIVERABLE_EXTS) + r")"
+)
+# A 400 from a spent daily model quota never recovers today; do not retry it.
+DAILY_LIMIT = re.compile(r"per-day|daily", re.I)
+
+
+def deliverable_paths(instruction):
+  """Extracts candidate deliverable file paths from the task instruction.
+
+  The instructions name their deliverables as absolute container paths
+  (``/filesystem/.../output/submission.zip``) or as paths relative to the task
+  folder (``output/submission.zip``, ``submission/model.ifc``). A path counts
+  when it has a slash and a deliverable extension; bare names such as
+  ``task.md`` (an input file) do not.
+
+  Args:
+    instruction: Task instruction text from the evaluator.
+
+  Returns:
+    De-duplicated candidate paths in order of appearance.
+  """
+  found = []
+  for m in _PATH_RE.finditer(instruction or ""):
+    p = m.group(0).strip("`\"'.,;:!?()[]")
+    if p and p not in found:
+      found.append(p)
+  return found
+
+
+def _resolve_candidates(paths, workdir, instruction=""):
+  """Resolves candidate paths against the container locations they may mean.
+
+  An absolute path is used as-is. A relative path is tried against the task
+  folder and against ``workdir``. The task folder comes from the
+  instruction's "working in ..." line when present, else from the directory
+  of the first absolute path in the instruction — that is where relative
+  ``output/...`` paths point.
+
+  Args:
+    paths: Candidate paths from :func:`deliverable_paths`.
+    workdir: The session's working directory in the container.
+    instruction: Task instruction text, used to find the task folder.
+
+  Returns:
+    De-duplicated absolute container paths to check.
+  """
+  taskdir = None
+  m = re.search(r"working in [`\"']?(/[^\s`\"']+)", instruction or "")
+  if m:
+    taskdir = m.group(1).rstrip("/")
+  if taskdir is None:
+    for p in paths:
+      if p.startswith("/"):
+        taskdir = os.path.dirname(p)
+        break
+  out = []
+  for p in paths:
+    cands = [p] if p.startswith("/") else []
+    if not p.startswith("/"):
+      cands.append(os.path.join(workdir, p))
+      if taskdir:
+        cands.append(os.path.join(taskdir, p))
+    for c in cands:
+      if c not in out:
+        out.append(c)
+  return out
+
+
+async def _inventory(session):
+  """Snapshots the container files under ``workdir`` as ``(sha256, count)``.
+
+  The hash is over the sorted file list, so any file created, changed, or
+  deleted changes it; the list itself never leaves the container.
+
+  Args:
+    session: Active `taskbridge.Session` connected to the task container.
+
+  Returns:
+    A ``(hash, count)`` tuple, or `None` when the snapshot cannot be taken.
+  """
+  try:
+    result = await session.exec(
+        "list=$(find "
+        + shlex.quote(session.workdir)
+        + " -type f 2>/dev/null | sort); "
+        "printf '%s' \"$list\" | sha256sum | cut -d' ' -f1; "
+        "printf '%s' \"$list\" | grep -c ."
+    )
+  except (taskbridge.TaskError, taskbridge.Cancelled):
+    return None
+  lines = (result.get("output") or "").strip().splitlines()
+  if len(lines) < 2:
+    return None
+  try:
+    return lines[0].strip(), int(lines[1].strip())
+  except ValueError:
+    return None
+
+
+async def deliverables_present(session, instruction, start_epoch, start_inventory):
+  """Returns whether the agent has written a deliverable for this task.
+
+  When the instruction names deliverable paths, a path counts only if it
+  exists and was written after the run started, so pre-existing input files
+  the instruction happens to mention do not count. When it names none, any
+  change to the container's file inventory since the run started counts. A
+  check that cannot run fails open (the run is allowed to finish) rather than
+  blocking on a broken probe.
+
+  Args:
+    session: Active `taskbridge.Session` connected to the task container.
+    instruction: Task instruction text from the evaluator.
+    start_epoch: Unix time just before the agent loop started.
+    start_inventory: The :func:`_inventory` snapshot from the run start, or
+      `None` when it could not be taken.
+
+  Returns:
+    `True` when a deliverable looks present, else `False`.
+  """
+  paths = deliverable_paths(instruction)
+  if paths:
+    quoted = " ".join(
+        shlex.quote(c)
+        for c in _resolve_candidates(paths, session.workdir, instruction)
+    )
+    try:
+      result = await session.exec(f"stat -c '%Y %n' {quoted} 2>/dev/null")
+    except (taskbridge.TaskError, taskbridge.Cancelled):
+      return True
+    for line in (result.get("output") or "").splitlines():
+      try:
+        mtime = int(line.split(" ", 1)[0])
+      except ValueError:
+        continue
+      if mtime >= start_epoch - 5:
+        return True
+    return False
+  if start_inventory is None:
+    return True
+  now = await _inventory(session)
+  return now is None or now != start_inventory
+
 # The evaluator sets OPENAI_BASE_URL and OPENAI_API_KEY for every model.
 # The SDK handles quick retries; recover() handles longer backoffs. Because
 # calls are non-streaming, a max-effort response can take over 15 minutes
@@ -73,7 +246,15 @@ SYSTEM = """You are an expert engineer working on a task in a Linux container wi
 act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with \
 code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check \
 it. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key \
-results."""
+results.
+
+Deliverables are files, not chat: the grader reads only the files the task names, and for most tasks it does not \
+read your final message at all, so a run that ends with no deliverable file on disk scores 0 however good your \
+summary is. Write a first COMPLETE version of every deliverable the task asks for as early as you can — within your \
+first few tool calls, before deep analysis — then improve it in place; the last version on disk when the run ends is \
+what gets graded, and an imperfect early file earns partial credit while no file earns none. Work efficiently: batch \
+independent tool calls in a single turn, and keep tool outputs short by running focused queries and summarizing with \
+code instead of dumping whole files into your context."""
 
 
 def tool(name, description, **params):
@@ -233,6 +414,11 @@ async def recover(session, messages, exc, waits, until):
   status = getattr(exc, "status_code", None)  # None: no HTTP answer
   if status == 400 and CONTEXT_FULL.search(str(exc)):
     return await shorten(session, messages)
+  if status == 429 and DAILY_LIMIT.search(str(exc)):
+    # A spent daily quota never recovers today: retrying burns the run's
+    # remaining time on calls that will all fail the same way.
+    await session.log("model call failed: the daily model quota is spent")
+    return False
   wait = next(waits, None)
   if wait is None or not (
       status is None or status in (408, 409, 429) or status >= 500
@@ -292,8 +478,12 @@ async def solve(session):
       {"role": "system", "content": SYSTEM.format(workdir=session.workdir)},
       {"role": "user", "content": session.instruction},
   ]
+  # The deliverable guard compares against the container as the run found it.
+  start_epoch = time.time()
+  start_inventory = await _inventory(session)
   # head: the start of an answer cut off at the output limit
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
+  deliverable_nudges = 0
   while True:
     left = session.time_left()  # None when the task has no time limit
     wrap_up = left is not None and left < WRAP_UP_SEC
@@ -339,6 +529,26 @@ async def solve(session):
     # endpoint's own fields.
     turn = message.model_dump(exclude_none=True)
     if wrap_up or not message.tool_calls:
+      if (
+          not wrap_up
+          and not message.tool_calls
+          and deliverable_nudges < MAX_DELIVERABLE_NUDGES
+          and not await deliverables_present(
+              session, session.instruction, start_epoch, start_inventory
+          )
+      ):
+        # The model is about to finish with nothing on disk to grade. Ask it
+        # to write the deliverable first; the check runs again if it tries to
+        # finish a second time. At wrap-up there is no time left to write, so
+        # the guard does not run there.
+        deliverable_nudges += 1
+        if message.content:  # keep the model's text in the conversation
+          messages.append(turn)
+        messages.append({"role": "user", "content": DELIVERABLE_NUDGE})
+        await session.log(
+            "no deliverable file on disk yet; asked the model to write it"
+        )
+        continue
       if wrap_up or (message.content and not cut) or nudges == MAX_NUDGES:
         return session.final_message
       nudges, head = nudges + 1, text
