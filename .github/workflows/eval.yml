@@ -1,0 +1,105 @@
+# PLE dev-set eval on GitHub Actions.
+#
+# The local dev machine cannot run Docker containers (its kernel blocks
+# setns), so the kit's eval runs here, one job per task, on ubuntu-latest
+# runners (Docker preinstalled, public repo = unlimited free minutes).
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   HF_TOKEN            Hugging Face read token (account granted access to
+#                       google/physical-engineerings-last-exam)
+#   OPENROUTER_API_KEY  OpenRouter API key (free tier) for the harness model
+#                       and the dev judge
+#
+# Trigger: Actions -> PLE dev-set eval -> Run workflow.
+#   tasks: comma-separated dev-task IDs; empty = all 29 dev tasks.
+# Each job uploads its runs/ output as artifact ple-run-<task>.
+name: PLE dev-set eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: 'Comma-separated task IDs (empty = all 29 dev tasks)'
+        required: false
+        default: 'wind-diaphragm-shear'
+      trials:
+        description: 'Parallel trials per job (1 is safest on a 4-CPU runner)'
+        required: false
+        default: '1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tasks: ${{ steps.list.outputs.tasks }}
+    steps:
+      - id: list
+        run: |
+          TASKS='${{ inputs.tasks }}'
+          if [ -z "$(echo "$TASKS" | tr -d '[:space:],')" ]; then
+            TASKS='data-hall-mep-routing,fire-test-validation-memo,data-hall-mep-routing-offset,eor-review-corrections,foundation-strategy,landscape-sheet-revision,data-center-site-model,engineers-estimate-check,footing-settlement-verification,solar-supplemental-review,solar-witness-test-package,frame-extension-method,fire-solve-convergence,les-mesh-resolution,mv-conveyance-study,data-hall-device-takeoff,division-26-specifications,heat-rejection-life-cycle-cost,cooling-water-flush-plan,wind-diaphragm-shear,seismic-diaphragm-shear,roof-deck-design,fill-compaction-acceptance,shoring-design-verification,emergency-spillway-check,pre-application-capacity-response,permission-to-operate-memo,backfeed-energization-reply,lv-cable-sizing'
+          fi
+          JSON=$(echo "$TASKS" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' | jq -R . | jq -s -c .)
+          echo "tasks=$JSON" >> "$GITHUB_OUTPUT"
+          echo "tasks: $JSON"
+
+  eval:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        task: ${{ fromJSON(needs.prepare.outputs.tasks) }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h
+      - name: Check out this harness
+        uses: actions/checkout@v4
+      - name: Check out the PLE kit (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: google-research/ple
+          ref: 8320f0402fdca9f42476607f72bcfd5271cd50c9
+          path: ple-kit
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+      - name: Install Harbor 0.20.0
+        run: |
+          uv tool install harbor==0.20.0 --with websockets
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check secrets are present
+        run: |
+          [ -n "${{ secrets.HF_TOKEN }}" ] || { echo "::error::HF_TOKEN secret is missing"; exit 1; }
+          [ -n "${{ secrets.OPENROUTER_API_KEY }}" ] || { echo "::error::OPENROUTER_API_KEY secret is missing"; exit 1; }
+          echo "secrets present"
+      - name: Write env file (not committed)
+        run: |
+          cat > ple-kit/local.env <<'EOF'
+          HF_TOKEN=${{ secrets.HF_TOKEN }}
+          MODEL_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+          JUDGE_BASE_URL=https://openrouter.ai/api/v1
+          JUDGE_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+          JUDGE_MODEL=nvidia/nemotron-3.5-super-vl:free
+          EOF
+          echo "env file written"
+      - name: Run the dev-set eval for ${{ matrix.task }}
+        working-directory: ple-kit
+        run: |
+          uv run python eval/run.py .. --env-file local.env --tasks ${{ matrix.task }} --trials ${{ inputs.trials }}
+      - name: Show disk and images (diagnostics)
+        if: always()
+        run: |
+          df -h
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | head -20
+      - name: Upload run output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-run-${{ matrix.task }}
+          path: ple-kit/runs/
+          if-no-files-found: warn
+          retention-days: 30
