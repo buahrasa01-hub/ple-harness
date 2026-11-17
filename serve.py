@@ -68,6 +68,22 @@ CACHE_MARK = "claude" in MODEL.lower()
 # 0 for most tasks. When the model tries to finish without having written any
 # deliverable, the loop asks it to write one first (at most this many times).
 MAX_DELIVERABLE_NUDGES = 2
+# A run can also die before ever trying to finish: the model spends its whole
+# request budget on analysis and is cut off by the daily quota or the time
+# limit (run 2: 49 requests, 417 s, no file). The finish-time guard above
+# cannot save such a run, so the loop also forces an early checkpoint: after
+# this many tool-call rounds, and every CHECKPOINT_EVERY_ROUNDS after that,
+# a run with no deliverable on disk is told to write one NOW.
+CHECKPOINT_FIRST_ROUND = 5
+CHECKPOINT_EVERY_ROUNDS = 15
+CHECKPOINT_NUDGE = (
+    "Checkpoint: stop analyzing and write the deliverable NOW. The grader "
+    "reads only the files this task names, so a run that ends with no file "
+    "scores 0 however good your analysis is. Write a first COMPLETE version "
+    "of {paths} with write_file or bash right now, using the results you "
+    "have so far — it does not have to be perfect — then keep improving it "
+    "in place. Do not run more analysis before the file exists."
+)
 DELIVERABLE_NUDGE = (
     "You have not written any deliverable file yet. The grader reads only the "
     "files this task names — for most tasks it does not read your final message, "
@@ -484,6 +500,7 @@ async def solve(session):
   # head: the start of an answer cut off at the output limit
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
   deliverable_nudges = 0
+  rounds, next_checkpoint = 0, CHECKPOINT_FIRST_ROUND
   while True:
     left = session.time_left()  # None when the task has no time limit
     wrap_up = left is not None and left < WRAP_UP_SEC
@@ -577,6 +594,32 @@ async def solve(session):
       messages[-1][
           "content"
       ] += f"\n[{int(session.time_left() // 60)} minutes left]"
+    rounds += 1
+    if rounds >= next_checkpoint:
+      # At wrap-up there is no time left to write, so the checkpoint does
+      # not run there; the finish-time guard already covers that case.
+      if not wrap_up and not await deliverables_present(
+          session, session.instruction, start_epoch, start_inventory
+      ):
+        paths = deliverable_paths(session.instruction)
+        named = (
+            ", ".join(
+                _resolve_candidates(
+                    paths, session.workdir, session.instruction
+                )
+            )
+            if paths
+            else "the deliverable file(s) the task asks for"
+        )
+        messages.append({
+            "role": "user",
+            "content": CHECKPOINT_NUDGE.format(paths=named),
+        })
+        await session.log(
+            f"round {rounds}: no deliverable on disk yet; forced a "
+            "checkpoint write"
+        )
+      next_checkpoint = rounds + CHECKPOINT_EVERY_ROUNDS
 
 
 if __name__ == "__main__":
