@@ -91,6 +91,25 @@ DELIVERABLE_NUDGE = (
     "the exact path the task names, in a first complete version (it does not "
     "have to be perfect), then reply with your summary."
 )
+# Run 43994777962 (17 Nov) scored 0 with a deliverable on disk: the agent's
+# own calculation script used a stale module-level variable `panel` instead of
+# the current row's key `p['mark']` in a lookup, so every looked-up coefficient
+# was wrong (deflection 146,038 in, cost Infinity, register recall 0.03). The
+# agent spotted the bug only in its last message, after the quota died. Before
+# the run is allowed to finish with deliverables on disk, the loop asks it
+# once to re-run its calculations and check the numbers are sane.
+VERIFY_NUDGE = (
+    "Before your final summary, verify the deliverables you wrote: re-run "
+    "your calculation script from scratch, open the deliverables again, and "
+    "check the key numbers are sane — finite, in the right units, and the "
+    "right order of magnitude. A deflection of thousands of inches, an "
+    "infinite or NaN cost, or a lookup table that returns the same value for "
+    "every row means a formula, units, or lookup error, not a real answer — "
+    "find it and fix it. In particular, when a script looks a value up by "
+    "key, use the current row's key (for example p['mark']), never a variable "
+    "left over from an earlier loop or module scope. If everything checks "
+    "out, reply with your summary."
+)
 # Extensions a task instruction names for its deliverables.
 DELIVERABLE_EXTS = (
     "zip",
@@ -261,7 +280,10 @@ client = openai.AsyncOpenAI(max_retries=5, timeout=1800)
 SYSTEM = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools \
 act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with \
 code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check \
-it. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key \
+it. Verify your numbers before you finish: re-run your calculation script after every edit and check the key results \
+are finite, in the right units, and the right order of magnitude — a deflection of thousands of inches or an infinite \
+cost is a formula or units error, not a real answer. When a script looks a value up by key, use the current row's key, \
+never a variable left over from an earlier loop or module scope. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key \
 results.
 
 Deliverables are files, not chat: the grader reads only the files the task names, and for most tasks it does not \
@@ -500,6 +522,7 @@ async def solve(session):
   # head: the start of an answer cut off at the output limit
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
   deliverable_nudges = 0
+  verified = False
   rounds, next_checkpoint = 0, CHECKPOINT_FIRST_ROUND
   while True:
     left = session.time_left()  # None when the task has no time limit
@@ -564,6 +587,27 @@ async def solve(session):
         messages.append({"role": "user", "content": DELIVERABLE_NUDGE})
         await session.log(
             "no deliverable file on disk yet; asked the model to write it"
+        )
+        continue
+      if (
+          not wrap_up
+          and not message.tool_calls
+          and not verified
+          and await deliverables_present(
+              session, session.instruction, start_epoch, start_inventory
+          )
+      ):
+        # Deliverables exist but their numbers have never been checked
+        # (run 43994777962: wrong lookup key, deflection 146,038 in, cost
+        # Infinity, score 0). Ask once for a verification pass before the
+        # run is allowed to finish; at wrap-up there is no time left.
+        verified = True
+        if message.content:  # keep the model's text in the conversation
+          messages.append(turn)
+        messages.append({"role": "user", "content": VERIFY_NUDGE})
+        await session.log(
+            "deliverables on disk; asked the model to verify them before "
+            "finishing"
         )
         continue
       if wrap_up or (message.content and not cut) or nudges == MAX_NUDGES:
