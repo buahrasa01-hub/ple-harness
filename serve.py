@@ -277,6 +277,12 @@ async def deliverables_present(session, instruction, start_epoch, start_inventor
 # idle limit.
 client = openai.AsyncOpenAI(max_retries=5, timeout=1800)
 
+# Run 44702206886 (20 Nov) died on the daily quota after 65 steps with no
+# deliverable: the agent burned requests relearning the same API mistakes
+# (ezdxf attribute names) instead of writing the zip. These go in SYSTEM
+# because the checkpoint nudges fired 4 times (rounds 5/20/35/50) and were
+# all ignored — another nudge will not help; the waste has to be prevented
+# up front.
 SYSTEM = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools \
 act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with \
 code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check \
@@ -285,6 +291,10 @@ are finite, in the right units, and the right order of magnitude — a deflectio
 cost is a formula or units error, not a real answer. When a script looks a value up by key, use the current row's key, \
 never a variable left over from an earlier loop or module scope. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key \
 results.
+
+Known pitfalls — do not relearn these by trial and error: with ezdxf, a layer's name is layer.dxf.name (not .name) \
+and a TEXT entity's string is entity.dxf.text (not .text); when a script looks a value up by key, use the current \
+row's key (for example p['mark']), never a variable left over from an earlier loop or module scope.
 
 Deliverables are files, not chat: the grader reads only the files the task names, and for most tasks it does not \
 read your final message at all, so a run that ends with no deliverable file on disk scores 0 however good your \
