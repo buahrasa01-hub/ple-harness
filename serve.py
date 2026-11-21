@@ -277,12 +277,121 @@ async def deliverables_present(session, instruction, start_epoch, start_inventor
 # idle limit.
 client = openai.AsyncOpenAI(max_retries=5, timeout=1800)
 
-# Run 44702206886 (20 Nov) died on the daily quota after 65 steps with no
-# deliverable: the agent burned requests relearning the same API mistakes
-# (ezdxf attribute names) instead of writing the zip. These go in SYSTEM
-# because the checkpoint nudges fired 4 times (rounds 5/20/35/50) and were
-# all ignored — another nudge will not help; the waste has to be prevented
-# up front.
+# Run 44842138147 (21 Nov) scored 0.0111 with a zip the agent had only
+# checked structurally (sheets present). Its content was wrong in ways a
+# script catches in under a second: deck_code "B-36" is not a catalogue code
+# (real codes: D22-36/4-2, ...), so the grader priced the deck at Infinity
+# and the objective was 0; chord codes "W8x24"/"HSS6x6x1/4" are not in the
+# chord catalogue (real codes: PL3x3/8, ..., PL12x1); the register had 10
+# rows, capping the paper score at ~0.03 whatever the design; and the
+# geometry was invented because the agent's hand-rolled IFC parser never
+# linked a property to the 63 panels it found. The two helpers below are
+# generic tools, not answers: a STEP parser and a structural self-check.
+# solve() writes them into the container at the start of every run so the
+# agent can use them; a run where the write fails still works, the agent
+# just falls back to hand-rolling (and the SYSTEM text says so).
+HARNESS_HELPERS = ("ifc_extract.py", "verify_submission.py")
+
+
+async def _install_helpers(session):
+  """Writes the harness helper scripts into the task container.
+
+  The scripts live next to serve.py on the serve host and are copied to
+  ``{workdir}/harness/`` in the container. They contain no task-specific
+  data — only a STEP-file parser and a structural zip checker. Any failure
+  fails open: the run continues without them.
+
+  Args:
+    session: Active `taskbridge.Session` connected to the task container.
+
+  Returns:
+    The names of the helpers that were installed.
+  """
+  installed = []
+  try:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in HARNESS_HELPERS:
+      with open(os.path.join(here, name), encoding="utf-8") as fh:
+        content = fh.read()
+      await session.write_file(
+          os.path.join(session.workdir, "harness", name), content
+      )
+      installed.append(name)
+  except (AttributeError, OSError, taskbridge.TaskError, taskbridge.Cancelled):
+    pass
+  if installed:
+    try:
+      await session.log(
+          "harness helpers installed in container: " + ", ".join(installed)
+      )
+    except (AttributeError, taskbridge.TaskError, taskbridge.Cancelled):
+      pass
+  return installed
+
+
+# Run 44842138147 (21 Nov): the agent wrote its first zip at step 22, then
+# spent steps 23-65 on IFC extraction and never re-packaged — the catalogue
+# knowledge it gained at steps 27-29 never entered the graded file, and the
+# run died on the daily quota. The checkpoint nudges only fire while NO
+# deliverable exists, so nothing reminded it. Every REPACKAGE_EVERY_ROUNDS
+# rounds the loop probes whether any file is newer than the zip; when one is,
+# it tells the model to re-package and re-verify now (at most
+# MAX_REPACKAGE_NUDGES times per zip version).
+REPACKAGE_EVERY_ROUNDS = 10
+MAX_REPACKAGE_NUDGES = 3
+REPACKAGE_NUDGE = (
+    "Your deliverable sources changed since the graded file was last "
+    "written. Re-run your pack script NOW, then run the verify script on "
+    "the fresh file and fix every FAIL — do that before any further "
+    "analysis. The last version on disk when the run ends is what gets "
+    "graded, so work that never reaches the file scores nothing."
+)
+
+
+async def _repackage_probe(session, instruction):
+  """Returns whether the graded zip is stale, and its mtime.
+
+  The zip is stale when it exists and some other file under the task
+  folder (the zip's grandparent directory — the zip itself lives in
+  ``<taskdir>/output/``) is newer than it, excluding the output/ folder.
+  Any probe failure fails open with ``(False, None)`` rather than blocking
+  the run.
+
+  Args:
+    session: Active `taskbridge.Session` connected to the task container.
+    instruction: Task instruction text, used to find the zip path.
+
+  Returns:
+    A ``(stale, mtime)`` tuple; ``mtime`` is ``None`` when the zip does
+    not exist or cannot be statted.
+  """
+  zips = [p for p in deliverable_paths(instruction) if p.endswith(".zip")]
+  if not zips:
+    return False, None
+  quoted = " ".join(
+      shlex.quote(c)
+      for c in _resolve_candidates(zips, session.workdir, instruction)
+  )
+  try:
+    result = await session.exec(
+        f"for z in {quoted}; do "
+        "if [ -f \"$z\" ]; then "
+        "stat -c '%Y' \"$z\"; "
+        # The zip lives in <taskdir>/output/; sources live in <taskdir>.
+        "find \"$(dirname \"$(dirname \"$z\")\")\" -type f -newer \"$z\" "
+        "! -path '*/output/*' -print -quit; "
+        "break; fi; done"
+    )
+  except (taskbridge.TaskError, taskbridge.Cancelled):
+    return False, None
+  lines = (result.get("output") or "").strip().splitlines()
+  if not lines:
+    return False, None
+  try:
+    mtime = int(lines[0].strip())
+  except ValueError:
+    return False, None
+  return len(lines) > 1, mtime
 SYSTEM = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools \
 act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with \
 code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check \
@@ -295,6 +404,23 @@ results.
 Known pitfalls — do not relearn these by trial and error: with ezdxf, a layer's name is layer.dxf.name (not .name) \
 and a TEXT entity's string is entity.dxf.text (not .text); when a script looks a value up by key, use the current \
 row's key (for example p['mark']), never a variable left over from an earlier loop or module scope.
+
+Catalogue codes are verbatim: a deck_code or chord section_code must be copied character-for-character from the \
+catalogue table in the task documents — a manual or series name (for example "CDS-B36") is not a code, and an \
+invented code prices at infinity, which zeroes the whole objective. The G', ASD capacity and installed cost for a \
+code come from that code's catalogue row (deck ASD = nominal / 2.35); if a value is not in the catalogue, the code \
+is wrong. Register generously: file at least 60 rows, one per governing requirement, citing the governing document \
+and clause exactly — a family counts only when it is both satisfied and registered, so a small register caps the \
+score whatever the design; never cite a superseded revision or another building's study, keep at most 3 clauses and \
+8 numbers per row, and check each cited clause really exists in that document. Take the geometry from the as-built \
+model first: run {workdir}/harness/ifc_extract.py on the federated IFC and use its panels, marks, positions and \
+profiles for the footprint, piers and parapet — never the superseded drawings' rectangle. If a hand-rolled parser \
+fails twice, stop and use that script; if it fails too, finish with the best valid file you have. Compute every \
+schedule number with code from the scenario data and the catalogue; a column that is a neat linear ramp across \
+scenarios is a placeholder, not a calculation. After the first valid deliverable, re-run your pack script and \
+python3 {workdir}/harness/verify_submission.py --zip <zip> --deck-catalogue <csv> --chord-catalogue <csv> after \
+EVERY change to a deliverable, and fix every FAIL before finishing; when the file is valid and the check passes, \
+finish — do not start new extraction work.
 
 Deliverables are files, not chat: the grader reads only the files the task names, and for most tasks it does not \
 read your final message at all, so a run that ends with no deliverable file on disk scores 0 however good your \
@@ -526,6 +652,9 @@ async def solve(session):
       {"role": "system", "content": SYSTEM.format(workdir=session.workdir)},
       {"role": "user", "content": session.instruction},
   ]
+  # Generic helper scripts first, so they do not count as agent deliverables
+  # in the inventory snapshot below.
+  await _install_helpers(session)
   # The deliverable guard compares against the container as the run found it.
   start_epoch = time.time()
   start_inventory = await _inventory(session)
@@ -533,6 +662,8 @@ async def solve(session):
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
   deliverable_nudges = 0
   verified = False
+  repackage_nudges = 0
+  last_zip_mtime = None
   rounds, next_checkpoint = 0, CHECKPOINT_FIRST_ROUND
   while True:
     left = session.time_left()  # None when the task has no time limit
@@ -649,6 +780,24 @@ async def solve(session):
           "content"
       ] += f"\n[{int(session.time_left() // 60)} minutes left]"
     rounds += 1
+    if (
+        rounds % REPACKAGE_EVERY_ROUNDS == 0
+        and not wrap_up
+        and repackage_nudges < MAX_REPACKAGE_NUDGES
+    ):
+      stale, mtime = await _repackage_probe(session, session.instruction)
+      if mtime is not None and mtime != last_zip_mtime:
+        # The zip was rewritten since the last probe: fresh version, the
+        # nudge budget resets.
+        last_zip_mtime = mtime
+        repackage_nudges = 0
+      if stale:
+        repackage_nudges += 1
+        messages.append({"role": "user", "content": REPACKAGE_NUDGE})
+        await session.log(
+            f"round {rounds}: deliverable sources newer than the graded "
+            "file; asked the model to re-package and re-verify"
+        )
     if rounds >= next_checkpoint:
       # At wrap-up there is no time left to write, so the checkpoint does
       # not run there; the finish-time guard already covers that case.
