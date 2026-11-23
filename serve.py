@@ -290,7 +290,20 @@ client = openai.AsyncOpenAI(max_retries=5, timeout=1800)
 # solve() writes them into the container at the start of every run so the
 # agent can use them; a run where the write fails still works, the agent
 # just falls back to hand-rolling (and the SYSTEM text says so).
-HARNESS_HELPERS = ("ifc_extract.py", "verify_submission.py")
+# Fix 3 (23 Nov): zones_extract.py + scheme_check.py join the helpers.
+# Run 418990917 (22 Nov) scored 0.0111 because the agent INVENTED its own
+# scheme: DeckZones D1/D2 and ChordSchedule C-N/COLL-GY/COLL-MW instead of
+# the 12 zones Z11..Z43 and 12 lines C-S/C-N1/... on S-201, and an invented
+# deck code CDS-B36-3/2. zones_extract.py reads the real scheme out of the
+# S-201 DXF and the catalogue workbooks (verified: its output matches the
+# grader's truth table exactly), and scheme_check.py refuses a zip whose
+# scheme does not match — the loop gates on it before the run may finish.
+HARNESS_HELPERS = (
+    "ifc_extract.py",
+    "verify_submission.py",
+    "zones_extract.py",
+    "scheme_check.py",
+)
 
 
 async def _install_helpers(session):
@@ -346,6 +359,127 @@ REPACKAGE_NUDGE = (
     "analysis. The last version on disk when the run ends is what gets "
     "graded, so work that never reaches the file scores nothing."
 )
+
+
+def _task_folder(instruction, workdir):
+  """Derives the task folder from the instruction, as _resolve_candidates does.
+
+  The task folder is the "working in ..." path when present, else the
+  directory of the first absolute deliverable path, else the workdir.
+  """
+  m = re.search(r"working in [`\"']?(/[^\s`\"']+)", instruction or "")
+  if m:
+    return m.group(1).rstrip("/")
+  for p in deliverable_paths(instruction):
+    if p.startswith("/"):
+      return os.path.dirname(p)
+  return workdir
+
+
+async def _run_zones_extract(session):
+  """Runs zones_extract.py in the container at the start of a run.
+
+  The script reads the zone/chord scheme and the catalogues out of the task
+  documents into {workdir}/harness/*.csv, which the agent and the scheme
+  gate read. Any failure fails open: the run continues without the CSVs
+  (the agent falls back to reading the documents, and the scheme gate
+  reports the check as unavailable rather than blocking).
+  """
+  harness = os.path.join(session.workdir, "harness")
+  taskdir = _task_folder(session.instruction, session.workdir)
+  try:
+    result = await session.exec(
+        f"python3 {shlex.quote(os.path.join(harness, 'zones_extract.py'))} "
+        f"--taskdir {shlex.quote(taskdir)} "
+        f"--out {shlex.quote(harness)}"
+    )
+  except (taskbridge.TaskError, taskbridge.Cancelled):
+    return False
+  out = (result.get("output") or "").strip()
+  ok = "zones_extract:" in out and "FAILED" not in out
+  try:
+    await session.log(
+        "zones_extract: " + (out.splitlines()[-1] if out else "no output")
+        if ok
+        else "zones_extract failed; scheme gate unavailable: " + out[:300]
+    )
+  except (AttributeError, taskbridge.TaskError, taskbridge.Cancelled):
+    pass
+  return ok
+
+
+# The scheme gate: a zip whose zone/chord IDs or catalogue codes are invented
+# prices at infinity and scores 0, and the agent in run 418990917 never
+# noticed because nothing checked. The loop runs scheme_check.py on the
+# graded zip at checkpoints and before finishing, and sends the model the
+# exact error list to fix (at most this many times per zip version).
+MAX_SCHEME_NUDGES = 3
+SCHEME_NUDGE = (
+    "The graded file FAILS the scheme check, so the grader would price it "
+    "at infinity and score 0. Fix these errors in the schedule — copy the "
+    "zone and line IDs verbatim from {harness}/zones.csv and "
+    "{harness}/chords.csv, and the deck/chord codes verbatim from "
+    "{harness}/deck_catalogue.csv and {harness}/chord_catalogue.csv — "
+    "re-package, and re-run the scheme check until it passes:\n{errors}"
+)
+
+
+async def _scheme_probe(session, instruction):
+  """Runs scheme_check.py on the graded zip, if one exists.
+
+  Returns ``(ok, errors, mtime)``: ``ok`` is True when the check passes,
+  False when it fails (``errors`` is the list of ERR lines, capped at 10),
+  and None when the check cannot run — no zip yet, helper or scheme CSVs
+  missing, or any probe failure — in which case the run is allowed to
+  continue (fail open). ``mtime`` is the zip's mtime, or None.
+  """
+  zips = [p for p in deliverable_paths(instruction) if p.endswith(".zip")]
+  if not zips:
+    return None, [], None
+  harness = os.path.join(session.workdir, "harness")
+  quoted = " ".join(
+      shlex.quote(c)
+      for c in _resolve_candidates(zips, session.workdir, instruction)
+  )
+  script = os.path.join(harness, "scheme_check.py")
+  try:
+    result = await session.exec(
+        f"for z in {quoted}; do "
+        "if [ -f \"$z\" ]; then "
+        f"stat -c '%Y' \"$z\"; "
+        f"python3 {shlex.quote(script)} --zip \"$z\" "
+        f"--zones {shlex.quote(os.path.join(harness, 'zones.csv'))} "
+        f"--chords {shlex.quote(os.path.join(harness, 'chords.csv'))} "
+        f"--deck-catalogue {shlex.quote(os.path.join(harness, 'deck_catalogue.csv'))} "
+        f"--chord-catalogue {shlex.quote(os.path.join(harness, 'chord_catalogue.csv'))} "
+        f"--meta {shlex.quote(os.path.join(harness, 'meta.json'))}; "
+        "echo \"SCHEME_EXIT:$?\"; "
+        "break; fi; done"
+    )
+  except (taskbridge.TaskError, taskbridge.Cancelled):
+    return None, [], None
+  lines = (result.get("output") or "").strip().splitlines()
+  if not lines:
+    return None, [], None
+  try:
+    mtime = int(lines[0].strip())
+  except ValueError:
+    return None, [], None
+  exit_line = next(
+      (ln for ln in lines if ln.startswith("SCHEME_EXIT:")), None
+  )
+  if exit_line is None:
+    return None, [], mtime
+  try:
+    code = int(exit_line.split(":", 1)[1])
+  except ValueError:
+    return None, [], mtime
+  if code == 0:
+    return True, [], mtime
+  if code == 2:
+    return None, [], mtime  # scheme inputs unavailable: fail open
+  errors = [ln[4:].strip() for ln in lines if ln.startswith("ERR ")]
+  return False, errors[:10], mtime
 
 
 async def _repackage_probe(session, instruction):
@@ -418,9 +552,23 @@ profiles for the footprint, piers and parapet — never the superseded drawings'
 fails twice, stop and use that script; if it fails too, finish with the best valid file you have. Compute every \
 schedule number with code from the scenario data and the catalogue; a column that is a neat linear ramp across \
 scenarios is a placeholder, not a calculation. After the first valid deliverable, re-run your pack script and \
-python3 {workdir}/harness/verify_submission.py --zip <zip> --deck-catalogue <csv> --chord-catalogue <csv> after \
+python3 {workdir}/harness/verify_submission.py --zip <zip> --deck-catalogue <csv> --chord-catalogue <csv> \
+--zones {workdir}/harness/zones.csv after \
 EVERY change to a deliverable, and fix every FAIL before finishing; when the file is valid and the check passes, \
 finish — do not start new extraction work.
+
+Scheme rules — the IDs and codes are the ones in the task documents, never invented: the roof zones and chord \
+lines are the 12 zone IDs and 12 line IDs in {workdir}/harness/zones.csv and {workdir}/harness/chords.csv — copy \
+them verbatim (D1/D2, C-N, COLL-GY, COLL-MW are not zone or line IDs); deck and chord codes come only from \
+{workdir}/harness/deck_catalogue.csv and {workdir}/harness/chord_catalogue.csv; a deck's G' is its catalogue value \
+times 1.15 only in the 4 ft zone, plain catalogue value elsewhere; the Cost sheet must have NO total row (the \
+grader sums every row, so a total double-counts) and its item rows must sum to the installed cost; the Chords sheet \
+reports a force for every chord line in every scenario (12 lines x 12 scenarios = 144 rows). After every re-package \
+run python3 {workdir}/harness/scheme_check.py --zip <zip> --zones {workdir}/harness/zones.csv --chords \
+{workdir}/harness/chords.csv --deck-catalogue {workdir}/harness/deck_catalogue.csv --chord-catalogue \
+{workdir}/harness/chord_catalogue.csv --meta {workdir}/harness/meta.json and fix every ERR before finishing. If \
+the harness CSVs are missing, run python3 {workdir}/harness/zones_extract.py --taskdir <task folder> \
+--out {workdir}/harness first (the harness runs it at the start of the run when it can).
 
 Deliverables are files, not chat: the grader reads only the files the task names, and for most tasks it does not \
 read your final message at all, so a run that ends with no deliverable file on disk scores 0 however good your \
@@ -655,6 +803,9 @@ async def solve(session):
   # Generic helper scripts first, so they do not count as agent deliverables
   # in the inventory snapshot below.
   await _install_helpers(session)
+  # Read the zone/chord scheme and catalogues out of the task documents
+  # before the agent starts, so the scheme gate has its inputs (fail-open).
+  await _run_zones_extract(session)
   # The deliverable guard compares against the container as the run found it.
   start_epoch = time.time()
   start_inventory = await _inventory(session)
@@ -664,6 +815,8 @@ async def solve(session):
   verified = False
   repackage_nudges = 0
   last_zip_mtime = None
+  scheme_nudges = 0
+  last_scheme_mtime = None
   rounds, next_checkpoint = 0, CHECKPOINT_FIRST_ROUND
   while True:
     left = session.time_left()  # None when the task has no time limit
@@ -738,6 +891,35 @@ async def solve(session):
               session, session.instruction, start_epoch, start_inventory
           )
       ):
+        # The scheme gate (fix 3): an invented zone/chord scheme prices at
+        # infinity and scores 0. Before the run may finish, the graded zip
+        # must pass scheme_check.py; a FAIL sends the exact error list back
+        # for correction (at most MAX_SCHEME_NUDGES times per zip version).
+        # A check that cannot run fails open, and an exhausted budget falls
+        # through to the verify nudge rather than blocking forever.
+        scheme_ok, scheme_errs, scheme_mtime = await _scheme_probe(
+            session, session.instruction
+        )
+        if scheme_mtime is not None and scheme_mtime != last_scheme_mtime:
+          last_scheme_mtime = scheme_mtime
+          scheme_nudges = 0
+        if scheme_ok is False and scheme_nudges < MAX_SCHEME_NUDGES:
+          scheme_nudges += 1
+          if message.content:  # keep the model's text in the conversation
+            messages.append(turn)
+          messages.append({
+              "role": "user",
+              "content": SCHEME_NUDGE.format(
+                  harness=os.path.join(session.workdir, "harness"),
+                  errors="\n".join(f"- {e}" for e in scheme_errs)
+                  or "- (no error lines captured; re-run scheme_check.py)",
+              ),
+          })
+          await session.log(
+              "graded zip fails the scheme check; asked the model to fix "
+              f"{len(scheme_errs)} scheme error(s) before finishing"
+          )
+          continue
         # Deliverables exist but their numbers have never been checked
         # (run 43994777962: wrong lookup key, deflection 146,038 in, cost
         # Infinity, score 0). Ask once for a verification pass before the
@@ -822,6 +1004,29 @@ async def solve(session):
             f"round {rounds}: no deliverable on disk yet; forced a "
             "checkpoint write"
         )
+      elif not wrap_up:
+        # A deliverable exists: run the scheme gate on it now, so an
+        # invented scheme is caught mid-run instead of at the finish line.
+        scheme_ok, scheme_errs, scheme_mtime = await _scheme_probe(
+            session, session.instruction
+        )
+        if scheme_mtime is not None and scheme_mtime != last_scheme_mtime:
+          last_scheme_mtime = scheme_mtime
+          scheme_nudges = 0
+        if scheme_ok is False and scheme_nudges < MAX_SCHEME_NUDGES:
+          scheme_nudges += 1
+          messages.append({
+              "role": "user",
+              "content": SCHEME_NUDGE.format(
+                  harness=os.path.join(session.workdir, "harness"),
+                  errors="\n".join(f"- {e}" for e in scheme_errs)
+                  or "- (no error lines captured; re-run scheme_check.py)",
+              ),
+          })
+          await session.log(
+              f"round {rounds}: graded zip fails the scheme check; asked "
+              f"the model to fix {len(scheme_errs)} scheme error(s)"
+          )
       next_checkpoint = rounds + CHECKPOINT_EVERY_ROUNDS
 
 

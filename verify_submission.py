@@ -176,7 +176,13 @@ def check_zip(path, report):
     return zf
 
 
-def check_schedule(zf, deck, chord, deck_span, report):
+def check_schedule(zf, deck, chord, deck_span, report, zones=None):
+    """Check the schedule workbook.
+
+    zones: optional {zone_id: span_ft} from zones_extract.py — the G'
+    span adjustment (manual note 4) is per zone (only the 4 ft zone gets
+    x1.15); deck_span is the fallback when no zones table is given.
+    """
     try:
         wb = openpyxl.load_workbook(zf.open("lateral_schedule.xlsx"), data_only=True)
     except Exception as exc:  # noqa: BLE001 - report, do not crash
@@ -210,7 +216,13 @@ def check_schedule(zf, deck, chord, deck_span, report):
                              "or manual name is not a code")
                 continue
             g_tab = _num(row.get("shear_stiffness_G_prime_kip_per_in"))
-            if deck_span == 4 and g_tab is not None:
+            zone_id = str(r.get("zone_id") or "").strip()
+            span = None
+            if zones is not None:
+                span = zones.get(zone_id)
+            if span is None:
+                span = deck_span
+            if span == 4 and g_tab is not None:
                 g_tab *= 1.15  # manual note 4: 4 ft span stiffens G' by 1.15
             nominal = _num(row.get("nominal_shear_strength_plf"))
             rate = _num(row.get("installed_cost_usd_per_sf"))
@@ -287,6 +299,16 @@ def check_schedule(zf, deck, chord, deck_span, report):
         total = 0.0
         for r in rows:
             q, u, t = (_num(r.get(c)) for c in ("quantity", "unit_cost_usd", "total_usd"))
+            # The grader sums EVERY Cost row (its parser has no TOTAL filter),
+            # so a TOTAL row double-counts and breaks the schedule check.
+            if re.match(r"^\s*(grand\s+)?(total|totals|sum|subtotal|sub-total|all)\b",
+                        str(r.get("item") or ""), re.I):
+                report.error("cost.total_row",
+                             f"{r.get('item')!r}: delete this TOTAL row — the "
+                             "grader sums every Cost row, so a total row "
+                             "double-counts; the item rows alone must sum to "
+                             "the installed cost")
+                continue
             if q is None or u is None or t is None or not _close(t, q * u, 0.01):
                 report.error("cost.arithmetic",
                              f"{r.get('item')}: total {t} != quantity {q} x ${u}")
@@ -347,7 +369,10 @@ def check_register(zf, min_rows, corpus, report):
         if len(parts) > 3:
             report.error("register.clauses",
                          f"row {i}: {len(parts)} clauses, at most 3 per row")
-        numbers = sum(len(_NUM_RE.findall(str(c))) for c in r)
+        # The grader counts numbers in requirement + value only (its
+        # _numbers strips designations such as S-201 and years); count the
+        # same fields so a document title full of digits is not a false alarm.
+        numbers = sum(len(_NUM_RE.findall(str(c))) for c in (r[2], r[3]))
         if numbers > 8:
             report.error("register.numbers",
                          f"row {i}: {numbers} numbers, at most 8 per row")
@@ -446,6 +471,8 @@ def main(argv=None):
     ap.add_argument("--register-min-rows", type=int, default=60)
     ap.add_argument("--deck-span", type=int, choices=(4, 6), default=6,
                     help="deck span in ft for the G' adjustment (manual note 4)")
+    ap.add_argument("--zones", help="zones.csv from zones_extract.py "
+                    "(per-zone span for the G' adjustment)")
     args = ap.parse_args(argv)
 
     report = Report()
@@ -469,7 +496,15 @@ def main(argv=None):
 
     zf = check_zip(args.zip_path, report)
     if zf is not None:
-        check_schedule(zf, deck, chord, args.deck_span, report)
+        zones = None
+        if args.zones:
+            try:
+                with open(args.zones, newline="") as fh:
+                    zones = {r["zone_id"]: int(r["span_ft"])
+                             for r in csv.DictReader(fh)}
+            except (OSError, KeyError, ValueError) as exc:
+                report.error("catalogue", f"cannot read zones table: {exc}")
+        check_schedule(zf, deck, chord, args.deck_span, report, zones)
         check_register(zf, args.register_min_rows, corpus, report)
         check_dxf(zf, report)
         check_pdf(zf, report)
